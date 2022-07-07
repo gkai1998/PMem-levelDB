@@ -266,7 +266,7 @@ if(HAVE_CLANG_THREAD_SAFETY)
     PUBLIC
       -Werror -Wthread-safety)
 endif(HAVE_CLANG_THREAD_SAFETY)
-
+target_link_libraries(leveldb pmem)
 if(HAVE_CRC32C)
   target_link_libraries(leveldb crc32c)
 endif(HAVE_CRC32C)

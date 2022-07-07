@@ -12,3 +12,6 @@ db
 After a range is completely deleted, what gets rid of the
 corresponding files if we do no future changes to that range.  Make
 the conditions for triggering compactions fire in more situations?
+
+for Pmem-levelDB
+1、改善日志刷入pm的策略，减少flush开销

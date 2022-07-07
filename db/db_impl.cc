@@ -4,14 +4,6 @@
 
 #include "db/db_impl.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <set>
-#include <string>
-#include <vector>
-
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -22,11 +14,20 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
 #include "leveldb/table.h"
 #include "leveldb/table_builder.h"
+
 #include "port/port.h"
 #include "table/block.h"
 #include "table/merger.h"
@@ -354,9 +355,13 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     }
   }
   if (!expected.empty()) {
-    char buf[50];
-    std::snprintf(buf, sizeof(buf), "%d missing files; e.g.",
-                  static_cast<int>(expected.size()));
+    //  这里也有问题，到时候改完代码记得改回去，这里的问题就是在gdb
+    //  debug时应该是栈溢出
+    char buf[20];
+    // std::snprintf(buf, sizeof(buf), "%d missing files; e.g.",
+    //               static_cast<int>(expected.size()));
+    buf[0] = '1';
+    buf[1] = '\0';
     return Status::Corruption(buf, TableFileName(dbname_, *(expected.begin())));
   }
 
@@ -401,9 +406,19 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   mutex_.AssertHeld();
 
   // Open the log file
-  std::string fname = LogFileName(dbname_, log_number);
-  SequentialFile* file;
-  Status status = env_->NewSequentialFile(fname, &file);
+  std::string fname = LogFileName("/mnt/pmemdir", log_number);
+  char* file_;
+  // Status status = env_->NewSequentialFile(fname, &file);
+  // 注意pm映射文件必须初始化一个大小，而日志有个长度，这里的想法是定义一个类似current的文件
+  // 在nvmlogwriter析构函数中持久化日志的长度
+  file_ = (char*)pmem_map_file(LogFileName("/mnt/pmemdir", log_number).c_str(),
+                               30 * 1024 * 1024, PMEM_FILE_CREATE, 0666,
+                               &mmaped_len, &is_pmem);
+  Status status;
+  if (file_ == nullptr) {
+    status = Status::IOError("in open function",
+                             "pmem map file error, lfile is nullptr");
+  }
   if (!status.ok()) {
     MaybeIgnoreError(&status);
     return status;
@@ -419,7 +434,10 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   // paranoid_checks==false so that corruptions cause entire commits
   // to be skipped instead of propagating bad information (like overly
   // large sequence numbers).
-  log::Reader reader(file, &reporter, true /*checksum*/, 0 /*initial_offset*/);
+
+  // TODO : reporter 有问题，应该上面继承出的问题
+  log::NvmLogReader reader(file_, nullptr, true /*checksum*/,
+                           0 /*initial_offset*/, 0);
   Log(options_.info_log, "Recovering log #%llu",
       (unsigned long long)log_number);
 
@@ -466,7 +484,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
     }
   }
 
-  delete file;
+  delete file_;
 
   // See if we should keep reusing the last log file.
   if (status.ok() && options_.reuse_logs && last_log && compactions == 0) {
@@ -474,18 +492,22 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
     assert(log_ == nullptr);
     assert(mem_ == nullptr);
     uint64_t lfile_size;
-    if (env_->GetFileSize(fname, &lfile_size).ok() &&
-        env_->NewAppendableFile(fname, &logfile_).ok()) {
-      Log(options_.info_log, "Reusing old log %s \n", fname.c_str());
-      log_ = new log::Writer(logfile_, lfile_size);
-      logfile_number_ = log_number;
-      if (mem != nullptr) {
-        mem_ = mem;
-        mem = nullptr;
-      } else {
-        // mem can be nullptr if lognum exists but was empty.
-        mem_ = new MemTable(internal_comparator_);
-        mem_->Ref();
+    if (env_->GetFileSize(fname, &lfile_size).ok()) {
+      logfile_ = (char*)pmem_map_file(
+          LogFileName("/mnt/pmemdir", log_number).c_str(), 30 * 1024 * 1024,
+          PMEM_FILE_CREATE, 0666, &mmaped_len, &is_pmem);
+      if (logfile_ != nullptr) {
+        Log(options_.info_log, "Reusing old log %s \n", fname.c_str());
+        log_ = new log::NvmLogWriter(logfile_, lfile_size);
+        logfile_number_ = log_number;
+        if (mem != nullptr) {
+          mem_ = mem;
+          mem = nullptr;
+        } else {
+          // mem can be nullptr if lognum exists but was empty.
+          mem_ = new MemTable(internal_comparator_);
+          mem_->Ref();
+        }
       }
     }
   }
@@ -1230,7 +1252,10 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
       bool sync_error = false;
       if (status.ok() && options.sync) {
-        status = logfile_->Sync();
+        // status = logfile_->Sync();
+        // TODO: 改善flush策略
+        // logsize是自己写的函数，这里持久化整个日志长度，不是很优
+        pmem_flush(logfile_, log_->LogSize());
         if (!status.ok()) {
           sync_error = true;
         }
@@ -1361,8 +1386,19 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // Attempt to switch to a new memtable and trigger compaction of old
       assert(versions_->PrevLogNumber() == 0);
       uint64_t new_log_number = versions_->NewFileNumber();
-      WritableFile* lfile = nullptr;
-      s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);
+      char* lfile;
+      // s = options.env->NewWritableFile(LogFileName(dbname, new_log_number),
+      //                                  &lfile);
+      size_t mmaped_len;
+      int is_pmem;
+      // 这里也有和上面一样创建pm文件的问题
+      lfile = (char*)pmem_map_file(
+          LogFileName("/mnt/pmemdir", new_log_number).c_str(), 30 * 1024 * 1024,
+          PMEM_FILE_CREATE, 0666, &mmaped_len, &is_pmem);
+      if (lfile == nullptr) {
+        Status s = Status::IOError("in open function",
+                                   "pmem map file error, lfile is nullptr");
+      }
       if (!s.ok()) {
         // Avoid chewing through file number space in a tight loop.
         versions_->ReuseFileNumber(new_log_number);
@@ -1372,7 +1408,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       delete logfile_;
       logfile_ = lfile;
       logfile_number_ = new_log_number;
-      log_ = new log::Writer(lfile);
+      log_ = new log::NvmLogWriter(lfile);
       imm_ = mem_;
       has_imm_.store(true, std::memory_order_release);
       mem_ = new MemTable(internal_comparator_);
@@ -1492,14 +1528,25 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   if (s.ok() && impl->mem_ == nullptr) {
     // Create new log and a corresponding memtable.
     uint64_t new_log_number = impl->versions_->NewFileNumber();
-    WritableFile* lfile;
-    s = options.env->NewWritableFile(LogFileName(dbname, new_log_number),
-                                     &lfile);
+    char* lfile;
+    // s = options.env->NewWritableFile(LogFileName(dbname, new_log_number),
+    //                                  &lfile);
+    size_t mmaped_len;
+    int is_pmem;
+    lfile = (char*)pmem_map_file(
+        LogFileName("/mnt/pmemdir", new_log_number).c_str(), 30 * 1024 * 1024,
+        PMEM_FILE_CREATE, 0666, &mmaped_len, &is_pmem);
+    if (lfile == nullptr) {
+      Status s = Status::IOError("in open function",
+                                 "pmem map file error, lfile is nullptr");
+    }
     if (s.ok()) {
       edit.SetLogNumber(new_log_number);
       impl->logfile_ = lfile;
       impl->logfile_number_ = new_log_number;
-      impl->log_ = new log::Writer(lfile);
+      impl->mmaped_len = mmaped_len;
+      impl->is_pmem = is_pmem;
+      impl->log_ = new log::NvmLogWriter(lfile);
       impl->mem_ = new MemTable(impl->internal_comparator_);
       impl->mem_->Ref();
     }

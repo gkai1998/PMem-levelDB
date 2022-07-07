@@ -5,9 +5,10 @@
 #ifndef STORAGE_LEVELDB_DB_LOG_WRITER_H_
 #define STORAGE_LEVELDB_DB_LOG_WRITER_H_
 
-#include <cstdint>
-
 #include "db/log_format.h"
+#include <cstdint>
+#include <libpmem.h>
+
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
 
@@ -47,7 +48,29 @@ class Writer {
   // record type stored in the header.
   uint32_t type_crc_[kMaxRecordType + 1];
 };
+class NvmLogWriter {
+ private:
+  char* dest_;
+  int block_offset_;
+  size_t num_blocks_;
+  Status EmitPhysicalRecord(RecordType type, const char* ptr, size_t length);
+  uint32_t type_crc_[kMaxRecordType + 1];
 
+ public:
+  explicit NvmLogWriter(char* dest);
+
+  // Create a writer that will append data to "*dest".
+  // "*dest" must have initial length "dest_length".
+  // "*dest" must remain live while this Writer is in use.
+  NvmLogWriter(char* dest, uint64_t dest_length);
+
+  NvmLogWriter(const NvmLogWriter&) = delete;
+  NvmLogWriter& operator=(const NvmLogWriter&) = delete;
+
+  ~NvmLogWriter();
+  size_t LogSize();
+  Status AddRecord(const Slice& slice);
+};
 }  // namespace log
 }  // namespace leveldb
 

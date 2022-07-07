@@ -5,16 +5,18 @@
 #ifndef STORAGE_LEVELDB_DB_DB_IMPL_H_
 #define STORAGE_LEVELDB_DB_DB_IMPL_H_
 
-#include <atomic>
-#include <deque>
-#include <set>
-#include <string>
-
 #include "db/dbformat.h"
 #include "db/log_writer.h"
 #include "db/snapshot.h"
+#include <atomic>
+#include <deque>
+#include <libpmem.h>
+#include <set>
+#include <string>
+
 #include "leveldb/db.h"
 #include "leveldb/env.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
@@ -177,9 +179,11 @@ class DBImpl : public DB {
   MemTable* mem_;
   MemTable* imm_ GUARDED_BY(mutex_);  // Memtable being compacted
   std::atomic<bool> has_imm_;         // So bg thread can detect non-null imm_
-  WritableFile* logfile_;
+  char* logfile_;
+  int is_pmem;
+  size_t mmaped_len;
   uint64_t logfile_number_ GUARDED_BY(mutex_);
-  log::Writer* log_;
+  log::NvmLogWriter* log_;
   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
 
   // Queue of writers.

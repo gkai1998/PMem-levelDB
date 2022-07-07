@@ -6,3 +6,6 @@
 # Build directory.
 build/
 out/
+# 自定义
+testforlearn/
+third_party/
